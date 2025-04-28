@@ -1,0 +1,658 @@
+import type { Express, Request, Response } from "express";
+import { createServer, type Server } from "http";
+import { storage } from "./storage";
+import { 
+  insertUserSchema, 
+  insertProductSchema, 
+  insertCartItemSchema, 
+  insertOrderSchema, 
+  insertOrderItemSchema,
+  loginSchema,
+  productFilterSchema,
+} from "@shared/schema";
+import { z } from "zod";
+import session from "express-session";
+import passport from "passport";
+import { Strategy as LocalStrategy } from "passport-local";
+import bcrypt from "bcryptjs";
+import MemoryStore from "memorystore";
+
+// For parsing query params
+const numberSchema = z.coerce.number();
+const booleanSchema = z.coerce.boolean();
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  const httpServer = createServer(app);
+  
+  // Session setup
+  const SessionStore = MemoryStore(session);
+  app.use(session({
+    secret: process.env.SESSION_SECRET || 'keyboard cat',
+    resave: false,
+    saveUninitialized: false,
+    cookie: { secure: process.env.NODE_ENV === 'production' },
+    store: new SessionStore({
+      checkPeriod: 86400000 // prune expired entries every 24h
+    }),
+  }));
+  
+  // Passport configuration
+  app.use(passport.initialize());
+  app.use(passport.session());
+  
+  passport.use(new LocalStrategy(
+    async (username, password, done) => {
+      try {
+        const user = await storage.getUserByUsername(username);
+        if (!user) {
+          return done(null, false, { message: 'Incorrect username.' });
+        }
+        
+        // In real application, use bcrypt.compare
+        // Here we're just comparing directly since we're storing plaintext in the memory storage
+        if (user.password !== password) {
+          return done(null, false, { message: 'Incorrect password.' });
+        }
+        
+        return done(null, user);
+      } catch (err) {
+        return done(err);
+      }
+    }
+  ));
+  
+  passport.serializeUser((user: any, done) => {
+    done(null, user.id);
+  });
+  
+  passport.deserializeUser(async (id: number, done) => {
+    try {
+      const user = await storage.getUser(id);
+      done(null, user);
+    } catch (err) {
+      done(err);
+    }
+  });
+  
+  // Auth middleware
+  const isAuthenticated = (req: Request, res: Response, next: Function) => {
+    if (req.isAuthenticated()) {
+      return next();
+    }
+    res.status(401).json({ message: 'Unauthorized' });
+  };
+  
+  const isAdmin = (req: Request, res: Response, next: Function) => {
+    if (req.isAuthenticated() && req.user && (req.user as any).isAdmin) {
+      return next();
+    }
+    res.status(403).json({ message: 'Forbidden: Admin access required' });
+  };
+  
+  // Auth Routes
+  app.post('/api/auth/login', (req, res, next) => {
+    try {
+      const validatedData = loginSchema.parse(req.body);
+      
+      passport.authenticate('local', (err: any, user: any, info: any) => {
+        if (err) {
+          return next(err);
+        }
+        if (!user) {
+          return res.status(401).json({ message: info.message || 'Authentication failed' });
+        }
+        
+        req.logIn(user, (err) => {
+          if (err) {
+            return next(err);
+          }
+          
+          // Return user without password
+          const { password, ...userWithoutPassword } = user;
+          return res.json({ user: userWithoutPassword });
+        });
+      })(req, res, next);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors });
+      }
+      next(error);
+    }
+  });
+  
+  app.post('/api/auth/logout', (req, res) => {
+    req.logout(() => {
+      res.json({ message: 'Logged out successfully' });
+    });
+  });
+  
+  app.get('/api/auth/session', (req, res) => {
+    if (req.isAuthenticated()) {
+      const { password, ...userWithoutPassword } = req.user as any;
+      return res.json({ user: userWithoutPassword });
+    }
+    res.json({ user: null });
+  });
+  
+  // User Routes
+  app.post('/api/users', async (req, res, next) => {
+    try {
+      const validatedData = insertUserSchema.parse(req.body);
+      
+      // Check if username or email already exists
+      const existingUser = await storage.getUserByUsername(validatedData.username);
+      if (existingUser) {
+        return res.status(400).json({ message: 'Username already exists' });
+      }
+      
+      const existingEmail = await storage.getUserByEmail(validatedData.email);
+      if (existingEmail) {
+        return res.status(400).json({ message: 'Email already exists' });
+      }
+      
+      // In a real app, hash the password
+      // validatedData.password = await bcrypt.hash(validatedData.password, 10);
+      
+      const newUser = await storage.createUser(validatedData);
+      
+      // Create a cart for the new user
+      await storage.createCart({ userId: newUser.id });
+      
+      // Exclude password from response
+      const { password, ...userWithoutPassword } = newUser;
+      res.status(201).json(userWithoutPassword);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors });
+      }
+      next(error);
+    }
+  });
+  
+  app.get('/api/users/profile', isAuthenticated, (req, res) => {
+    const { password, ...userWithoutPassword } = req.user as any;
+    res.json(userWithoutPassword);
+  });
+  
+  app.put('/api/users/profile', isAuthenticated, async (req, res, next) => {
+    try {
+      const userId = (req.user as any).id;
+      // Partial validation - only validate fields that are provided
+      const updateData: Record<string, any> = {};
+      
+      // Only allow certain fields to be updated
+      const allowedFields = ['fullName', 'address', 'phone', 'email'];
+      for (const field of allowedFields) {
+        if (req.body[field] !== undefined) {
+          updateData[field] = req.body[field];
+        }
+      }
+      
+      if (Object.keys(updateData).length === 0) {
+        return res.status(400).json({ message: 'No valid fields to update' });
+      }
+      
+      if (updateData.email) {
+        const existingEmail = await storage.getUserByEmail(updateData.email);
+        if (existingEmail && existingEmail.id !== userId) {
+          return res.status(400).json({ message: 'Email already in use' });
+        }
+      }
+      
+      const updatedUser = await storage.updateUser(userId, updateData);
+      if (!updatedUser) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+      
+      const { password, ...userWithoutPassword } = updatedUser;
+      res.json(userWithoutPassword);
+    } catch (error) {
+      next(error);
+    }
+  });
+  
+  // Product Routes
+  app.get('/api/products', async (req, res, next) => {
+    try {
+      // Parse and validate query parameters
+      const filter: Record<string, any> = {};
+      
+      if (req.query.category) {
+        filter.category = req.query.category as string;
+      }
+      
+      if (req.query.priceMin) {
+        filter.priceMin = numberSchema.parse(req.query.priceMin);
+      }
+      
+      if (req.query.priceMax) {
+        filter.priceMax = numberSchema.parse(req.query.priceMax);
+      }
+      
+      if (req.query.searchQuery) {
+        filter.searchQuery = req.query.searchQuery as string;
+      }
+      
+      if (req.query.inStock) {
+        filter.inStock = booleanSchema.parse(req.query.inStock);
+      }
+      
+      const validatedFilter = Object.keys(filter).length > 0 
+        ? productFilterSchema.parse(filter) 
+        : undefined;
+      
+      const products = await storage.getProducts(validatedFilter);
+      res.json(products);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors });
+      }
+      next(error);
+    }
+  });
+  
+  app.get('/api/products/:id', async (req, res, next) => {
+    try {
+      const id = numberSchema.parse(req.params.id);
+      const product = await storage.getProduct(id);
+      
+      if (!product) {
+        return res.status(404).json({ message: 'Product not found' });
+      }
+      
+      res.json(product);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors });
+      }
+      next(error);
+    }
+  });
+  
+  app.post('/api/products', isAdmin, async (req, res, next) => {
+    try {
+      const validatedData = insertProductSchema.parse(req.body);
+      const newProduct = await storage.createProduct(validatedData);
+      res.status(201).json(newProduct);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors });
+      }
+      next(error);
+    }
+  });
+  
+  app.put('/api/products/:id', isAdmin, async (req, res, next) => {
+    try {
+      const id = numberSchema.parse(req.params.id);
+      
+      // Only validate fields that are provided
+      const updateData: Record<string, any> = {};
+      const fields = ['name', 'description', 'price', 'imageUrl', 'category', 'inventory'];
+      
+      for (const field of fields) {
+        if (req.body[field] !== undefined) {
+          updateData[field] = req.body[field];
+        }
+      }
+      
+      if (Object.keys(updateData).length === 0) {
+        return res.status(400).json({ message: 'No valid fields to update' });
+      }
+      
+      const updatedProduct = await storage.updateProduct(id, updateData);
+      
+      if (!updatedProduct) {
+        return res.status(404).json({ message: 'Product not found' });
+      }
+      
+      res.json(updatedProduct);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors });
+      }
+      next(error);
+    }
+  });
+  
+  app.delete('/api/products/:id', isAdmin, async (req, res, next) => {
+    try {
+      const id = numberSchema.parse(req.params.id);
+      const success = await storage.deleteProduct(id);
+      
+      if (!success) {
+        return res.status(404).json({ message: 'Product not found' });
+      }
+      
+      res.status(204).end();
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors });
+      }
+      next(error);
+    }
+  });
+  
+  // Cart Routes
+  app.get('/api/cart', isAuthenticated, async (req, res, next) => {
+    try {
+      const userId = (req.user as any).id;
+      let cart = await storage.getCartByUserId(userId);
+      
+      // Create cart if it doesn't exist
+      if (!cart) {
+        cart = await storage.createCart({ userId });
+      }
+      
+      const cartItems = await storage.getCartItemWithProduct(cart.id);
+      
+      // Calculate total
+      const total = cartItems.reduce((sum, item) => {
+        return sum + (item.product.price * item.quantity);
+      }, 0);
+      
+      res.json({
+        id: cart.id,
+        items: cartItems,
+        total
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+  
+  app.post('/api/cart/items', isAuthenticated, async (req, res, next) => {
+    try {
+      const userId = (req.user as any).id;
+      let cart = await storage.getCartByUserId(userId);
+      
+      // Create cart if it doesn't exist
+      if (!cart) {
+        cart = await storage.createCart({ userId });
+      }
+      
+      const validatedData = insertCartItemSchema.parse({
+        ...req.body,
+        cartId: cart.id
+      });
+      
+      // Check if product exists and has inventory
+      const product = await storage.getProduct(validatedData.productId);
+      if (!product) {
+        return res.status(404).json({ message: 'Product not found' });
+      }
+      
+      if (product.inventory < validatedData.quantity) {
+        return res.status(400).json({ message: 'Not enough inventory available' });
+      }
+      
+      const cartItem = await storage.addCartItem(validatedData);
+      
+      // Return full cart item with product
+      const cartItemWithProduct = {
+        ...cartItem,
+        product
+      };
+      
+      res.status(201).json(cartItemWithProduct);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors });
+      }
+      next(error);
+    }
+  });
+  
+  app.put('/api/cart/items/:id', isAuthenticated, async (req, res, next) => {
+    try {
+      const id = numberSchema.parse(req.params.id);
+      const userId = (req.user as any).id;
+      
+      // Validate the user owns this cart item
+      const cart = await storage.getCartByUserId(userId);
+      if (!cart) {
+        return res.status(404).json({ message: 'Cart not found' });
+      }
+      
+      const cartItems = await storage.getCartItems(cart.id);
+      const cartItem = cartItems.find(item => item.id === id);
+      
+      if (!cartItem) {
+        return res.status(404).json({ message: 'Cart item not found' });
+      }
+      
+      // Validate quantity
+      if (req.body.quantity !== undefined) {
+        if (req.body.quantity <= 0) {
+          // Remove item if quantity is 0 or negative
+          await storage.removeCartItem(id);
+          return res.status(204).end();
+        }
+        
+        // Check product inventory
+        const product = await storage.getProduct(cartItem.productId);
+        if (!product) {
+          return res.status(404).json({ message: 'Product not found' });
+        }
+        
+        if (product.inventory < req.body.quantity) {
+          return res.status(400).json({ message: 'Not enough inventory available' });
+        }
+      }
+      
+      const updatedCartItem = await storage.updateCartItem(id, { quantity: req.body.quantity });
+      
+      if (!updatedCartItem) {
+        return res.status(404).json({ message: 'Cart item not found' });
+      }
+      
+      // Return full cart item with product
+      const product = await storage.getProduct(updatedCartItem.productId);
+      const cartItemWithProduct = {
+        ...updatedCartItem,
+        product
+      };
+      
+      res.json(cartItemWithProduct);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors });
+      }
+      next(error);
+    }
+  });
+  
+  app.delete('/api/cart/items/:id', isAuthenticated, async (req, res, next) => {
+    try {
+      const id = numberSchema.parse(req.params.id);
+      const userId = (req.user as any).id;
+      
+      // Validate the user owns this cart item
+      const cart = await storage.getCartByUserId(userId);
+      if (!cart) {
+        return res.status(404).json({ message: 'Cart not found' });
+      }
+      
+      const cartItems = await storage.getCartItems(cart.id);
+      const cartItem = cartItems.find(item => item.id === id);
+      
+      if (!cartItem) {
+        return res.status(404).json({ message: 'Cart item not found' });
+      }
+      
+      const success = await storage.removeCartItem(id);
+      
+      if (!success) {
+        return res.status(404).json({ message: 'Cart item not found' });
+      }
+      
+      res.status(204).end();
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors });
+      }
+      next(error);
+    }
+  });
+  
+  // Order Routes
+  app.get('/api/orders', isAuthenticated, async (req, res, next) => {
+    try {
+      const userId = (req.user as any).id;
+      const orders = await storage.getOrdersByUserId(userId);
+      res.json(orders);
+    } catch (error) {
+      next(error);
+    }
+  });
+  
+  app.get('/api/orders/:id', isAuthenticated, async (req, res, next) => {
+    try {
+      const orderId = numberSchema.parse(req.params.id);
+      const userId = (req.user as any).id;
+      
+      // Get the order
+      const order = await storage.getOrder(orderId);
+      
+      if (!order) {
+        return res.status(404).json({ message: 'Order not found' });
+      }
+      
+      // Verify the order belongs to the user
+      if (order.userId !== userId && !(req.user as any).isAdmin) {
+        return res.status(403).json({ message: 'Access denied' });
+      }
+      
+      // Get order items with products
+      const orderItems = await storage.getOrderItemWithProduct(orderId);
+      
+      res.json({
+        ...order,
+        items: orderItems
+      });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors });
+      }
+      next(error);
+    }
+  });
+  
+  app.post('/api/orders', isAuthenticated, async (req, res, next) => {
+    try {
+      const userId = (req.user as any).id;
+      
+      // Get user cart
+      const cart = await storage.getCartByUserId(userId);
+      if (!cart) {
+        return res.status(404).json({ message: 'Cart not found' });
+      }
+      
+      // Get cart items
+      const cartItems = await storage.getCartItemWithProduct(cart.id);
+      if (cartItems.length === 0) {
+        return res.status(400).json({ message: 'Cart is empty' });
+      }
+      
+      // Calculate total
+      const total = cartItems.reduce((sum, item) => {
+        return sum + (item.product.price * item.quantity);
+      }, 0);
+      
+      // Validate shipping address
+      if (!req.body.shippingAddress) {
+        return res.status(400).json({ message: 'Shipping address is required' });
+      }
+      
+      // Create order
+      const orderData = {
+        userId,
+        total,
+        shippingAddress: req.body.shippingAddress,
+        status: 'pending'
+      };
+      
+      const validatedOrderData = insertOrderSchema.parse(orderData);
+      const order = await storage.createOrder(validatedOrderData);
+      
+      // Create order items and update inventory
+      for (const cartItem of cartItems) {
+        const product = cartItem.product;
+        
+        // Check inventory again
+        if (product.inventory < cartItem.quantity) {
+          // Rollback - delete the created order
+          // In a real DB we would use transactions
+          return res.status(400).json({ 
+            message: `Not enough inventory for product: ${product.name}` 
+          });
+        }
+        
+        // Create order item
+        await storage.addOrderItem({
+          orderId: order.id,
+          productId: product.id,
+          quantity: cartItem.quantity,
+          price: product.price
+        });
+        
+        // Update inventory
+        await storage.updateProduct(product.id, {
+          inventory: product.inventory - cartItem.quantity
+        });
+        
+        // Remove item from cart
+        await storage.removeCartItem(cartItem.id);
+      }
+      
+      // Get the complete order with items
+      const orderItems = await storage.getOrderItemWithProduct(order.id);
+      
+      res.status(201).json({
+        ...order,
+        items: orderItems
+      });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors });
+      }
+      next(error);
+    }
+  });
+  
+  // Admin order management
+  app.put('/api/admin/orders/:id/status', isAdmin, async (req, res, next) => {
+    try {
+      const orderId = numberSchema.parse(req.params.id);
+      
+      // Validate status
+      const validStatuses = ['pending', 'processing', 'shipped', 'delivered', 'cancelled'];
+      if (!req.body.status || !validStatuses.includes(req.body.status)) {
+        return res.status(400).json({ 
+          message: `Invalid status. Must be one of: ${validStatuses.join(', ')}` 
+        });
+      }
+      
+      const updatedOrder = await storage.updateOrderStatus(orderId, req.body.status);
+      
+      if (!updatedOrder) {
+        return res.status(404).json({ message: 'Order not found' });
+      }
+      
+      // Get order items with products
+      const orderItems = await storage.getOrderItemWithProduct(orderId);
+      
+      res.json({
+        ...updatedOrder,
+        items: orderItems
+      });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: error.errors });
+      }
+      next(error);
+    }
+  });
+  
+  return httpServer;
+}
